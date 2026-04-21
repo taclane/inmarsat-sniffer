@@ -18,6 +18,8 @@
 #include <string.h>
 #include "simd_kernels.h"
 #include <stdio.h>
+
+extern int verbose;
 #include <complex.h>
 
 #include "channelizer.h"
@@ -681,9 +683,9 @@ void channelizer_adjust_center(channelizer_t *ch, double offset_hz) {
     }
 
     ch->center_freq -= offset_hz;
-    fprintf(stderr,
-            "Channelizer: adjusted center by %.0f Hz (new: %.3f MHz)\n",
-            offset_hz, ch->center_freq / 1e6);
+    if (verbose)
+        fprintf(stderr, "Channelizer: adjusted center by %.0f Hz (new: %.3f MHz)\n",
+                offset_hz, ch->center_freq / 1e6);
 }
 
 void channelizer_finalize(channelizer_t *ch) {

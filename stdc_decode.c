@@ -999,9 +999,9 @@ static void parse_packets(stdc_decoder_t *d, const uint8_t *frame,
         int calc_crc = compute_crc(frame, pos, pkt_len);
         int crc_ok = (pkt_crc == 0) || (pkt_crc == calc_crc);
 
-        if (crc_ok)
+        if (crc_ok) {
             atomic_fetch_add(&stat_stdc_crc_ok, 1);
-        else {
+        } else {
             atomic_fetch_add(&stat_stdc_crc_fail, 1);
             pos += pkt_len;
             continue;

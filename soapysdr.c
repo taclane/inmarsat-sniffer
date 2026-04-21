@@ -6,6 +6,7 @@
  */
 
 #include <err.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,6 +149,49 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
 
     if (SoapySDRDevice_setSampleRate(device, SOAPY_SDR_RX, 0, samp_rate) != 0)
         errx(1, "Unable to set SoapySDR sample rate: %s", SoapySDRDevice_lastError());
+
+    /* Read back actual rate — some drivers silently accept unsupported
+     * values but use a different internal rate. */
+    {
+        double actual = SoapySDRDevice_getSampleRate(device, SOAPY_SDR_RX, 0);
+        if (actual > 0 && fabs(actual - samp_rate) > 1000.0) {
+            fprintf(stderr,
+                    "SoapySDR: requested %.6f MHz, device accepted %.6f MHz\n",
+                    samp_rate / 1e6, actual / 1e6);
+            samp_rate = actual;
+        }
+    }
+
+    /* Snap to nearest discrete rate if device reports a list.
+     * Devices like the Airspy R2 support only a few exact rates (2.5/10 MSPS);
+     * requesting anything else produces a garbage hardware clock. */
+    {
+        size_t num_rates = 0;
+        double *rates = SoapySDRDevice_listSampleRates(
+            device, SOAPY_SDR_RX, 0, &num_rates);
+        if (rates && num_rates > 0) {
+            double best = rates[0];
+            double best_diff = fabs(rates[0] - samp_rate);
+            for (size_t i = 1; i < num_rates; i++) {
+                double d = fabs(rates[i] - samp_rate);
+                /* Prefer lower rate when tie — but also cap at 10 MHz */
+                if (d < best_diff && rates[i] <= 10e6) {
+                    best_diff = d;
+                    best = rates[i];
+                }
+            }
+            free(rates);
+            if (best_diff > 1000.0) {
+                fprintf(stderr,
+                        "SoapySDR: snapping %.6f MHz to nearest discrete rate %.6f MHz\n",
+                        samp_rate / 1e6, best / 1e6);
+                samp_rate = best;
+                if (SoapySDRDevice_setSampleRate(device, SOAPY_SDR_RX, 0, samp_rate) != 0)
+                    errx(1, "Unable to set SoapySDR sample rate: %s",
+                         SoapySDRDevice_lastError());
+            }
+        }
+    }
 
     fprintf(stderr, "SoapySDR: sample rate: %.3f MHz\n", samp_rate / 1e6);
 

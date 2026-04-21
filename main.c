@@ -414,6 +414,7 @@ atomic_ulong stat_pos_text = 0;
 atomic_ulong stat_pos_waypoint = 0;
 atomic_ulong stat_stdc_ber_sum = 0;   /* fixed-point * 10000 */
 atomic_ulong stat_stdc_ber_count = 0;
+atomic_int   stat_cal_offset_hz = 0;  /* current EMA carrier offset (Hz) */
 atomic_ulong stat_aero_ber_sum = 0;
 atomic_ulong stat_aero_ber_count = 0;
 atomic_int stat_stdc_synced = 0;
@@ -519,6 +520,7 @@ static void print_status(void) {
     unsigned long sc_fail = atomic_load(&stat_stdc_crc_fail);
     unsigned long sb_sum = atomic_load(&stat_stdc_ber_sum);
     unsigned long sb_cnt = atomic_load(&stat_stdc_ber_count);
+    int cal_off = atomic_load(&stat_cal_offset_hz);
     int synced = atomic_load(&stat_stdc_synced);
     unsigned long bursts = atomic_load(&stat_aero_bursts);
     unsigned long msgs = atomic_load(&stat_aero_msgs);
@@ -539,19 +541,22 @@ static void print_status(void) {
     if (feed_drops > 0)
         snprintf(fd_buf, sizeof(fd_buf), " feed_drop:%lu", feed_drops);
 
+    char off_str[16];
+    snprintf(off_str, sizeof(off_str), "%+d Hz", cal_off);
+
     if (op_mode == MODE_AERO) {
-        fprintf(stderr, "\r[Aero: %s bursts %lu msgs CRC:%lu | drop:%lu%s]   ",
-                burst_str, msgs, ac_ok, drops, fd_buf);
+        fprintf(stderr, "\r[Aero: %s bursts %lu msgs CRC:%lu | off:%s drop:%lu%s]   ",
+                burst_str, msgs, ac_ok, off_str, drops, fd_buf);
     } else if (op_mode == MODE_STDC) {
-        fprintf(stderr, "\r[STD-C: %lu %s BER:%.2f CRC:%lu/%lu | drop:%lu%s]   ",
+        fprintf(stderr, "\r[STD-C: %lu %s BER:%.2f CRC:%lu/%lu | off:%s drop:%lu%s]   ",
                 stdc, synced ? "SYNC" : "SRCH",
-                stdc_ber, sc_ok, sc_ok + sc_fail, drops, fd_buf);
+                stdc_ber, sc_ok, sc_ok + sc_fail, off_str, drops, fd_buf);
     } else {
         fprintf(stderr, "\r[STD-C: %lu %s BER:%.2f CRC:%lu/%lu | "
-                "Aero: %s bursts %lu msgs CRC:%lu | drop:%lu%s]   ",
+                "Aero: %s bursts %lu msgs CRC:%lu | off:%s drop:%lu%s]   ",
                 stdc, synced ? "SYNC" : "SRCH",
                 stdc_ber, sc_ok, sc_ok + sc_fail,
-                burst_str, msgs, ac_ok, drops, fd_buf);
+                burst_str, msgs, ac_ok, off_str, drops, fd_buf);
     }
 }
 
@@ -925,6 +930,14 @@ static void jaero_bits_cb(const unsigned char *bits, int num_bits,
 
 /* ---- IQ dump for debugging ---- */
 
+/* ---- Auto-calibration constants ---- */
+#define CAL_SIZE       1024   /* samples collected per measurement */
+#define CAL_INTERVAL_S 6.0    /* seconds between measurements */
+#define CAL_APPLY_HZ   20.0   /* minimum mean offset to trigger correction */
+#define CAL_BINS       90     /* DFT bins evaluated either side of DC */
+#define CAL_RING_N     20     /* ring buffer depth: 20 × 6 s = 2 min window */
+#define CAL_MIN_N      5      /* minimum measurements before first correction */
+
 /* ---- Channel output callback ---- */
 
 static void channel_output_cb(int channel_id, channel_type_t type,
@@ -982,53 +995,153 @@ static void channel_output_cb(int channel_id, channel_type_t type,
         return;
     }
 
-    /* Auto-calibrate: measure carrier offset from first aero channel,
-     * then adjust channelizer center freq to compensate SDR PPM error.
-     * Runs once at startup only — periodic recal was causing drift on
-     * SDRs with stable oscillators (SDRplay). */
+    /* Auto-calibrate: use STD-C EGC (preferred, continuous BPSK carrier) or
+     * the lowest-frequency Aero 600/1200 channel as a fallback reference.
+     *
+     *   - BPSK squaring (I²−Q²) + 2jIQ removes data modulation before DFT,
+     *     giving a clean tone at 2×offset regardless of data content.
+     *   - Narrow phasor DFT: evaluates only ±CAL_BINS bins around DC (O(N)
+     *     per bin).
+     *   - Ring buffer of CAL_RING_N measurements (CAL_RING_N × CAL_INTERVAL_S
+     *     ≈ 2 min window). Each entry is stored as an absolute offset
+     *     (raw residual + sum of corrections applied) so the ring always
+     *     speaks in hardware-error terms, independent of how many corrections
+     *     have been issued.
+     *   - Correction fires when |mean − last_applied| > CAL_APPLY_HZ, i.e.
+     *     when the window has drifted from the last settled value — not on
+     *     absolute magnitude, which would re-trigger constantly.
+     *   - STD-C EGC preferred; falls back to lowest-id 600/1200-baud Aero
+     *     channel (closest to NCS P-channel, most continuous carrier).
+     */
     {
-        static float complex cal_buf[1024];
+        static float complex cal_buf[CAL_SIZE];
         static int cal_n = 0;
         static int cal_ch = -1;
-        static int cal_done = 0;
-        #define CAL_SIZE 1024
+        static int cal_pref_stdc = 0;
+        static int cal_best_aero_ch = -1;    /* lowest-id AERO_600 seen */
+        static int cal_best_aero1200_ch = -1; /* lowest-id AERO_1200 seen */
+        static double cal_last_time = 0.0;
+        static double cal_applied_hz = 0.0;  /* sum of all corrections applied */
+        static double cal_ring[CAL_RING_N];  /* circular buffer of offset measurements */
+        static int    cal_ring_idx = 0;      /* next write position */
+        static int    cal_ring_cnt = 0;      /* valid entries (0..CAL_RING_N) */
 
-        if (!cal_done && cal_ch < 0 && (type == CHAN_AERO_600 || type == CHAN_AERO_1200)) {
+        /* Track the best Aero reference channel (lowest channel_id per baud).
+         * Lower channel_id → lower frequency → closer to NCS P-channel. */
+        if (type == CHAN_AERO_600 &&
+            (cal_best_aero_ch < 0 || channel_id < cal_best_aero_ch))
+            cal_best_aero_ch = channel_id;
+        if (type == CHAN_AERO_1200 &&
+            (cal_best_aero1200_ch < 0 || channel_id < cal_best_aero1200_ch))
+            cal_best_aero1200_ch = channel_id;
+
+        /* Upgrade to STD-C the moment we see it (always preferred). */
+        if (type == CHAN_STDC_EGC && !cal_pref_stdc) {
             cal_ch = channel_id;
+            cal_pref_stdc = 1;
             cal_n = 0;
         }
-        if (!cal_done && cal_ch >= 0 && channel_id == cal_ch) {
+
+        /* Initial latch: if no STD-C yet, use best Aero reference. */
+        if (cal_ch < 0 && !cal_pref_stdc) {
+            int aero_ref = (cal_best_aero_ch >= 0) ? cal_best_aero_ch
+                         : cal_best_aero1200_ch;
+            if (aero_ref >= 0) {
+                cal_ch = aero_ref;
+                cal_n = 0;
+            }
+        }
+
+        /* Re-point Aero reference if a better (lower-id) channel appeared. */
+        if (!cal_pref_stdc && cal_ch >= 0) {
+            int aero_ref = (cal_best_aero_ch >= 0) ? cal_best_aero_ch
+                         : cal_best_aero1200_ch;
+            if (aero_ref >= 0 && aero_ref < cal_ch) {
+                cal_ch = aero_ref;
+                cal_n = 0;
+            }
+        }
+
+        if (cal_ch >= 0 && channel_id == cal_ch) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+
+            /* Collect samples into buffer */
             int need = CAL_SIZE - cal_n;
             int take = num_samples < need ? num_samples : need;
             memcpy(&cal_buf[cal_n], samples, take * sizeof(float complex));
             cal_n += take;
 
-            if (cal_n >= CAL_SIZE) {
+            if (cal_n >= CAL_SIZE && (now - cal_last_time) >= CAL_INTERVAL_S) {
+                cal_last_time = now;
+                cal_n = 0;
+
+                double output_rate = channelizer_output_rate(channelizer, cal_ch);
+                if (output_rate > 0) {
+
+                /* BPSK squaring: (re + j·im)² = (re²−im²) + 2j·re·im
+                 * Removes BPSK data modulation — the squared signal has a
+                 * spectral peak at 2×carrier_offset regardless of data. */
+                float complex squared[CAL_SIZE];
+                for (int n = 0; n < CAL_SIZE; n++) {
+                    float re = crealf(cal_buf[n]);
+                    float im = cimagf(cal_buf[n]);
+                    squared[n] = (float complex)((re*re - im*im) + 2.0f*re*im * 1.0fi);
+                }
+
+                /* Phasor DFT: evaluate only ±CAL_BINS bins around DC.
+                 * The peak at bin k gives offset = k * output_rate/2 / CAL_SIZE
+                 * (the /2 un-does the ×2 from squaring). */
                 double max_pwr = 0;
                 int max_bin = 0;
-                for (int k = 0; k < CAL_SIZE; k++) {
+                for (int k = -CAL_BINS; k <= CAL_BINS; k++) {
                     double re = 0, im = 0;
+                    double dphi = -2.0 * M_PI * k / CAL_SIZE;
+                    double cr = cos(dphi), sr = sin(dphi);
+                    double pr = 1, pi_v = 0;  /* phasor accumulator */
                     for (int n = 0; n < CAL_SIZE; n++) {
-                        double angle = -2.0 * M_PI * k * n / CAL_SIZE;
-                        re += crealf(cal_buf[n]) * cos(angle) - cimagf(cal_buf[n]) * sin(angle);
-                        im += crealf(cal_buf[n]) * sin(angle) + cimagf(cal_buf[n]) * cos(angle);
+                        re += crealf(squared[n]) * pr - cimagf(squared[n]) * pi_v;
+                        im += crealf(squared[n]) * pi_v + cimagf(squared[n]) * pr;
+                        double tmp = pr * cr - pi_v * sr;
+                        pi_v = pr * sr + pi_v * cr;
+                        pr = tmp;
                     }
-                    double pwr = re * re + im * im;
+                    double pwr = re*re + im*im;
                     if (pwr > max_pwr) { max_pwr = pwr; max_bin = k; }
                 }
-                double output_rate = channelizer_output_rate(channelizer, cal_ch);
-                int half = CAL_SIZE / 2;
-                int offset_bin = max_bin > half ? max_bin - CAL_SIZE : max_bin;
-                double offset_hz = offset_bin * output_rate / CAL_SIZE;
 
-                if (fabs(offset_hz) > 50.0) {
-                    fprintf(stderr, "Auto-cal: carrier offset %.0f Hz on ch%d, adjusting center freq\n",
-                            offset_hz, cal_ch);
-                    channelizer_adjust_center(channelizer, offset_hz);
-                } else {
-                    fprintf(stderr, "Auto-cal: centered (%.0f Hz), no adjustment\n", offset_hz);
+                /* Convert bin to Hz (undo the ×2 squaring factor) */
+                double offset_hz = max_bin * output_rate * 0.5 / CAL_SIZE;
+
+                /* Store absolute offset: raw residual + all corrections applied so
+                 * far. This way the ring always speaks in terms of the SDR's true
+                 * hardware error regardless of how many corrections have been made.
+                 * After a correction the residual shrinks, but cal_applied_hz grows
+                 * by the same amount, so the stored value stays consistent. */
+                double abs_hz = offset_hz + cal_applied_hz;
+                cal_ring[cal_ring_idx] = abs_hz;
+                cal_ring_idx = (cal_ring_idx + 1) % CAL_RING_N;
+                if (cal_ring_cnt < CAL_RING_N) cal_ring_cnt++;
+
+                /* Windowed mean over all valid entries — best estimate of the
+                 * SDR's absolute frequency error from the satellite reference. */
+                double mean_hz = 0;
+                for (int ri = 0; ri < cal_ring_cnt; ri++) mean_hz += cal_ring[ri];
+                mean_hz /= cal_ring_cnt;
+
+                /* Publish absolute offset to the status line */
+                atomic_store(&stat_cal_offset_hz, (int)mean_hz);
+
+                /* Trigger when the mean has drifted away from what we've already
+                 * corrected for — not on absolute magnitude, which is always
+                 * non-zero once the SDR's base error is known. */
+                double drift_hz = mean_hz - cal_applied_hz;
+                if (cal_ring_cnt >= CAL_MIN_N && fabs(drift_hz) > CAL_APPLY_HZ) {
+                    channelizer_adjust_center(channelizer, drift_hz);
+                    cal_applied_hz = mean_hz;  /* snap to new settled value */
                 }
-                cal_done = 1;
+                } /* end if (output_rate > 0) */
             }
         }
     }
